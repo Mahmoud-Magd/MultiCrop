@@ -1,0 +1,368 @@
+package com.magd.multicrop.manager.commands;
+
+
+
+import android.graphics.Path;
+import android.graphics.RectF;
+
+import com.magd.multicrop.enums.RegionOperation;
+import com.magd.multicrop.manager.CropEntry;
+import com.magd.multicrop.manager.CropManager;
+import com.magd.multicrop.models.CropRect;
+import com.magd.multicrop.regions.children.FreePathRegion;
+import com.magd.multicrop.utils.ColorAssigner;
+import com.magd.multicrop.views.crop_area.CropArea;
+
+import java.util.ArrayDeque;
+import java.util.Deque;
+
+
+
+// =========================================================
+// FreeDrawSession
+// =========================================================
+
+// Manages one complete free-drawing session.
+
+// =========================================================
+// TWO MODES:
+
+    // ADD mode (targetEntry == null):
+        // commit() creates a brand-new CropEntry and adds it to the list.
+
+    // REPLACE mode (targetEntry != null):
+        // commit() calls manager.reshape() on the target entry,
+        // replacing its region with the newly drawn FreePathRegion.
+        // Full undo/redo via CropHistoryManager after commit.
+
+// =========================================================
+// SESSION STATES:
+
+    // IDLE       -> nothing drawn yet.
+    // DRAWING    -> finger is currently down (stroke in progress).
+    // PAUSED     -> finger lifted, path has content, ready for more or commit.
+    // COMMITTED  -> commit() succeeded. Session is over.
+
+// =========================================================
+// UNDO / REDO (within session, before commit):
+
+    // Unit = one completed stroke (startStroke → endStroke).
+    // Before each stroke: snapshot of current path pushed to undoStack.
+    // undo() -> restores last snapshot, pushes current to redoStack.
+    // redo() -> re-applies last undone snapshot.
+    // New stroke clears redoStack.
+    // clear() resets both stacks.
+
+// =========================================================
+// LISTENER CALLBACKS:
+
+    // onPathChanged (Path screenPath):
+        // After every stroke event.
+        // Path already in SCREEN SPACE — draw directly to canvas.
+
+    // onCommitted (CropEntry entry):
+        // After successful commit().
+
+    // onError (String reason):
+        // commit() on empty path, or other invalid state.
+
+// =========================================================
+
+public class FreeDrawSession {
+
+
+
+    // =========================================================
+    // ENUMS
+    // =========================================================
+
+    public enum State {
+        IDLE,
+        DRAWING,
+        PAUSED,
+        COMMITTED
+    }
+
+
+
+    // =========================================================
+    // LISTENER
+    // =========================================================
+
+    public interface SessionListener {
+
+        // Called after every stroke event.
+        // screenPath is already in screen space — draw directly.
+        void onPathChanged (Path screenPath);
+
+        // Called after successful commit().
+        void onCommitted (CropEntry entry);
+
+        // Called on invalid commit or any session error.
+        void onError (String reason);
+    }
+
+
+
+    // =========================================================
+    // VARIABLES
+    // =========================================================
+
+    private final CropManager     manager;
+    private final CropEntry       targetEntry; // null = ADD, non-null = REPLACE.
+    private final SessionListener listener;
+    private final FreePathRegion  region;      // The single growing region.
+
+    // Per-stroke undo/redo stacks.
+    // Each entry is a Path snapshot of the region BEFORE a stroke began.
+    private final Deque <Path> undoStack = new ArrayDeque<>();
+    private final Deque <Path> redoStack = new ArrayDeque<>();
+
+    private State state                 = State.IDLE;
+    private Path  strokeStartSnapshot   = null; // Captured at startStroke().
+
+
+
+    // =========================================================
+    // CONSTRUCTORS
+    // =========================================================
+
+    // ADD mode.
+    public FreeDrawSession (
+        CropManager                  manager,
+        SessionListener              listener,
+        FreePathRegion.DrawMode      drawMode,
+        float                        strokeWidth
+    ) {
+        this (manager, null, listener, drawMode, strokeWidth);
+    }
+
+    // REPLACE mode.
+    public FreeDrawSession (
+        CropManager                  manager,
+        CropEntry                    targetEntry,
+        SessionListener              listener,
+        FreePathRegion.DrawMode      drawMode,
+        float                        strokeWidth
+    ) {
+        this.manager     = manager;
+        this.targetEntry = targetEntry;
+        this.listener    = listener;
+        this.region      = new FreePathRegion (drawMode, strokeWidth);
+    }
+
+
+
+    // =========================================================
+    // PUBLIC METHODS — STROKE RECORDING
+    // =========================================================
+
+    // Call on ACTION_DOWN.
+    public void startStroke (float imageX, float imageY) {
+        if (state == State.COMMITTED) return;
+
+        // Snapshot BEFORE this stroke — pushed to undoStack on endStroke().
+        strokeStartSnapshot = new Path (region.buildPath());
+
+        // New stroke invalidates redo history.
+        redoStack.clear();
+
+        region.startStroke (imageX, imageY);
+        state = State.DRAWING;
+
+        notifyPathChanged();
+    }
+
+    // Call on ACTION_MOVE.
+    public void continueStroke (float imageX, float imageY) {
+        if (state != State.DRAWING) return;
+
+        region.continueStroke (imageX, imageY);
+        notifyPathChanged();
+    }
+
+    // Call on ACTION_UP.
+    public void endStroke (float imageX, float imageY) {
+        if (state != State.DRAWING) return;
+
+        region.endStroke (imageX, imageY);
+
+        if (strokeStartSnapshot != null) {
+            undoStack.push (strokeStartSnapshot);
+            strokeStartSnapshot = null;
+        }
+
+        state = region.isEmpty() ? State.IDLE : State.PAUSED;
+
+        notifyPathChanged();
+    }
+
+
+
+    // =========================================================
+    // PUBLIC METHODS — UNDO / REDO
+    // =========================================================
+
+    // Undoes the last completed stroke.
+    public boolean undo() {
+        if (!canUndo()) return false;
+
+        Path current  = new Path (region.buildPath());
+        Path snapshot = undoStack.pop();
+
+        redoStack.push (current);
+        region.restorePath (snapshot);
+
+        state = region.isEmpty() ? State.IDLE : State.PAUSED;
+
+        notifyPathChanged();
+        return true;
+    }
+
+    // Redoes the last undone stroke.
+    public boolean redo() {
+        if (!canRedo()) return false;
+
+        Path current  = new Path (region.buildPath());
+        Path snapshot = redoStack.pop();
+
+        undoStack.push (current);
+        region.restorePath (snapshot);
+
+        state = region.isEmpty() ? State.IDLE : State.PAUSED;
+
+        notifyPathChanged();
+        return true;
+    }
+
+    public boolean canUndo() { return !undoStack.isEmpty() && state != State.DRAWING; }
+    public boolean canRedo() { return !redoStack.isEmpty() && state != State.DRAWING; }
+
+
+
+    // =========================================================
+    // PUBLIC METHODS — SETTINGS
+    // =========================================================
+
+    // Changes stroke width — affects future stamps only.
+    // Past stamps are already baked into the live path.
+    public void setStrokeWidth (float strokeWidth) {
+        region.setStrokeWidth (strokeWidth);
+    }
+
+    public void setDrawMode (FreePathRegion.DrawMode mode) {
+        region.setDrawMode (mode);
+    }
+
+
+
+    // =========================================================
+    // PUBLIC METHODS — CLEAR
+    // =========================================================
+
+    // Clears all drawing — resets to IDLE.
+    public void clear() {
+        region.clear();
+        undoStack.clear();
+        redoStack.clear();
+        strokeStartSnapshot = null;
+        state = State.IDLE;
+        notifyPathChanged();
+    }
+
+
+
+    // =========================================================
+    // PUBLIC METHODS — COMMIT
+    // =========================================================
+
+    // Finalises the session.
+    // ADD mode     -> creates a new CropEntry.
+    // REPLACE mode -> reshapes the target entry via ReshapeCommand.
+    // Fires onError() if path is empty.
+    public void commit() {
+        if (region.isEmpty()) {
+            if (listener != null) listener.onError ("Nothing drawn yet.");
+            return;
+        }
+
+        if (state == State.COMMITTED) return;
+
+        CropEntry result = (targetEntry == null)
+            ? commitAsNewEntry()
+            : commitAsReshape();
+
+        state = State.COMMITTED;
+
+        if (listener != null) listener.onCommitted (result);
+    }
+
+
+
+    // =========================================================
+    // PUBLIC METHODS — STATE / GETTERS
+    // =========================================================
+
+    public State                   getState()       { return state;                  }
+    public FreePathRegion.DrawMode getDrawMode()    { return region.getDrawMode();   }
+    public float                   getStrokeWidth() { return region.getStrokeWidth();}
+    public boolean                 isCommitted()    { return state == State.COMMITTED; }
+
+
+
+    // =========================================================
+    // PRIVATE METHODS — COMMIT
+    // =========================================================
+
+    private CropEntry commitAsNewEntry() {
+        RectF bounds = region.getBounds();
+        if (bounds == null) bounds = new RectF (0, 0, 100, 100);
+
+        CropRect rect = new CropRect (
+            bounds.left,
+            bounds.top,
+            bounds.right,
+            bounds.bottom
+        );
+
+        CropArea area = manager.addCropArea (
+            region,
+            rect,
+            RegionOperation.UNION,
+            ColorAssigner.next (manager.getAllColors())
+        );
+
+        String    label = "Draw " + (manager.getCount() + 1);
+        CropEntry entry = new CropEntry (area, label);
+        manager.addEntry (entry);
+        manager.notifyListChanged();
+
+        return entry;
+    }
+
+    private CropEntry commitAsReshape() {
+        manager.reshape (targetEntry, region);
+        return targetEntry;
+    }
+
+
+
+    // =========================================================
+    // PRIVATE METHODS — NOTIFY
+    // =========================================================
+
+    // Converts current region path from image space to screen space
+    // and fires onPathChanged so the drawing canvas can redraw.
+    private void notifyPathChanged() {
+        if (listener == null) return;
+
+        Path imagePath  = region.buildPath();
+        Path screenPath = new Path();
+        manager.getMultiCrop().imagePathToScreen (imagePath, screenPath);
+
+        listener.onPathChanged (screenPath);
+    }
+
+
+
+}

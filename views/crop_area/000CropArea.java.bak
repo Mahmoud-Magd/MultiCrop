@@ -1,0 +1,380 @@
+package com.magd.multicrop.views.crop_area;
+
+
+
+import android.content.Context;
+import android.graphics.Canvas;
+import android.graphics.Paint;
+import android.graphics.PointF;
+import android.graphics.RectF;
+import android.view.MotionEvent;
+import android.view.View;
+
+import com.magd.multicrop.enums.GuideLineMode;
+import com.magd.multicrop.enums.HandleType;
+import com.magd.multicrop.enums.TouchTarget;
+
+import com.magd.multicrop.geometry.HandlePositionCalculator;
+import com.magd.multicrop.geometry.ResizeEngine;
+import com.magd.multicrop.geometry.ZoomPanEngine;
+
+import com.magd.multicrop.models.CropRect;
+
+import com.magd.multicrop.regions.CropRegion;
+
+import com.magd.multicrop.render.GuideLinesDrawer;
+import com.magd.multicrop.render.handle.HandleDrawer;
+
+import com.magd.multicrop.utils.DimensUtils;
+
+
+
+// =========================================================
+// CropArea
+// =========================================================
+
+// A single interactive crop shape drawn on screen.
+
+// =========================================================
+// RESPONSIBILITY:
+
+// CropArea is the interactive layer.
+// It handles:
+    // Drawing the region border
+    // Drawing the 8 resize handles
+    // Drawing the 3x3 guidelines
+    // Touch input (move + resize)
+    // Converting touches to image space via ZoomPanEngine
+
+// It does NOT:
+    // Draw the tint (that is MultiCrop's responsibility)
+    // Know about other CropAreas
+    // Export bitmaps
+
+// =========================================================
+// COORDINATE SPACES:
+
+// CropRect lives in IMAGE SPACE.
+    // (0,0) = top-left of source image.
+    // This is the source of truth.
+
+// Drawing happens in SCREEN SPACE.
+    // CropRect is converted via ZoomPanEngine before drawing.
+
+// Touch events arrive in SCREEN SPACE.
+    // They are converted to IMAGE SPACE via ZoomPanEngine
+    // before modifying CropRect.
+
+// =========================================================
+// TOUCH PRIORITY (strict order):
+    // 1. Handle touched -> RESIZE
+    // 2. Inside region -> MOVE
+    // 3. Outside -> IGNORE (return false)
+
+// =========================================================
+// CHANGE CALLBACK:
+
+// Every move or resize fires onChanged().
+// MultiCrop uses this to:
+    // Rebuild the tint mask path
+    // Invalidate the tint view
+
+// =========================================================
+
+public class CropArea extends View {
+
+
+
+    // =========================================================
+    // CALLBACKS
+    // =========================================================
+
+    // Notifies MultiCrop that this area moved or resized.
+    public interface ChangeCallback {
+        void onChanged (CropArea area);
+    }
+
+    // Notifies MultiCrop that this area should come to front.
+    public interface BringToFrontCallback {
+        void onBroughtToFront (CropArea area);
+    }
+
+
+
+    // =========================================================
+    // CONSTANTS
+    // =========================================================
+    private static final float BORDER_STROKE_DP = 2f; // Border stroke width in dp.
+
+
+
+    // =========================================================
+    // VARIABLES
+    // =========================================================
+
+    // Core geometry — IMAGE SPACE.
+    private final CropRect   cropRect; // The crop rectangle in image space.
+    private final CropRegion region;   // Region that this CropArea edits.
+
+    // Rendering.
+    private final int              color;      // Assigned crop area color.
+    private final Paint            borderPaint; // Border stroke paint.
+    private final GuideLinesDrawer guideLines;  // 3x3 grid renderer.
+    private final HandleDrawer[]   handles;     // 8 handle renderers.
+
+    // Zoom/pan reference (shared from MultiCrop).
+    private ZoomPanEngine zoomPan; // Reference. Never owned here.
+
+    // Touch state.
+    private TouchTarget activeTarget    = TouchTarget.NONE;
+    private float       touchDownImageX = 0f;
+    private float       touchDownImageY = 0f;
+
+    private final CropRect rectAtTouchDown = new CropRect (0, 0, 1, 1);
+    private final CropRect lastValidRect   = new CropRect (0, 0, 1, 1);
+
+    // Active state.
+    private boolean isActive = false;
+
+    // Callbacks.
+    private ChangeCallback       changeCallback;
+    private BringToFrontCallback bringToFrontCallback;
+
+
+
+    // =========================================================
+    // CONSTRUCTORS
+    // =========================================================
+
+    public CropArea (
+        Context       context,
+        CropRegion    region,
+        CropRect      initialRect,
+        int           color,
+        ZoomPanEngine zoomPan
+    ) {
+        super (context);
+
+        this.region   = region;
+        this.color    = color;
+        this.zoomPan  = zoomPan;
+        this.cropRect = initialRect.copy();
+
+        setWillNotDraw (false);
+
+        // Border paint.
+        borderPaint = new Paint (Paint.ANTI_ALIAS_FLAG);
+        borderPaint.setStyle (Paint.Style.STROKE);
+        borderPaint.setColor (color);
+        borderPaint.setStrokeWidth ( DimensUtils.dpToPx (BORDER_STROKE_DP) );
+        borderPaint.setAlpha (204); // ~80% alpha.
+
+        // Guidelines.
+        guideLines = new GuideLinesDrawer (GuideLineMode.ON_TOUCH);
+        guideLines.setColor (color);
+
+        // 8 handles.
+        handles = new HandleDrawer [HandleType.values().length];
+        HandleType[] types = HandleType.values();
+        for (int i = 0; i < types.length; i++) {
+            handles [i] = new HandleDrawer (types [i]);
+            handles [i].setColor (color);
+        }
+    }
+
+
+
+    // =========================================================
+    // DRAWING
+    // =========================================================
+
+    @Override
+    protected void onDraw (Canvas canvas) {
+        if (zoomPan == null) return;
+
+        // Get crop rect in screen space.
+        RectF   screenRectF  = zoomPan.imageRectToScreen ( cropRect.toRectF() );
+        CropRect screenRect  = new CropRect (
+            screenRectF.left,
+            screenRectF.top,
+            screenRectF.right,
+            screenRectF.bottom
+        );
+
+        // Draw border.
+        canvas.drawRect (screenRectF, borderPaint);
+
+        // Draw guidelines (only during interaction, via ON_TOUCH mode).
+        boolean isInteracting = (activeTarget != TouchTarget.NONE);
+        guideLines.draw (canvas, screenRect, isInteracting);
+
+        // Draw 8 handles.
+        HandleType[] types = HandleType.values();
+        for (int i = 0; i < types.length; i++) {
+            PointF center = HandlePositionCalculator.getCenter (types [i], screenRect);
+            handles [i].draw (canvas, center.x, center.y);
+        }
+    }
+
+
+
+    // =========================================================
+    // TOUCH HANDLING
+    // =========================================================
+
+    @Override
+    public boolean onTouchEvent (MotionEvent event) {
+        if (zoomPan == null) return false;
+
+        float  screenX    = event.getX();
+        float  screenY    = event.getY();
+        PointF imagePoint = zoomPan.screenToImage (screenX, screenY);
+        float  imageX     = imagePoint.x;
+        float  imageY     = imagePoint.y;
+
+        switch (event.getActionMasked()) {
+
+            case MotionEvent.ACTION_DOWN: {
+                TouchTarget target = resolveTouchTarget (screenX, screenY);
+                if (target == TouchTarget.NONE) return false;
+
+                activeTarget    = target;
+                touchDownImageX = imageX;
+                touchDownImageY = imageY;
+                rectAtTouchDown.set (cropRect);
+                lastValidRect.set (cropRect);
+
+                setActive (true);
+                if (bringToFrontCallback != null) bringToFrontCallback.onBroughtToFront (this);
+                bringToFront();
+                getParent().requestDisallowInterceptTouchEvent (true);
+                return true;
+            }
+
+            case MotionEvent.ACTION_MOVE: {
+                if (activeTarget == TouchTarget.NONE) return false;
+
+                float dx = imageX - touchDownImageX;
+                float dy = imageY - touchDownImageY;
+
+                if (activeTarget == TouchTarget.BODY) {
+                    // Move.
+                    cropRect.set (rectAtTouchDown);
+                    cropRect.offset (dx, dy, getImageWidth(), getImageHeight());
+                } else {
+                    // Resize.
+                    HandleType handleType = CropAreaMaps.toHandleType (activeTarget);
+                    if (handleType != null) {
+                        CropRect proposed = rectAtTouchDown.copy();
+                        boolean applied = ResizeEngine.apply (
+                            handleType, dx, dy, proposed,
+                            getImageWidth(), getImageHeight()
+                        );
+                        if (applied) {
+                            cropRect.set (proposed);
+                            lastValidRect.set (proposed);
+                        } else {
+                            cropRect.set (lastValidRect); // Hold at last valid — no bounce.
+                        }
+                    }
+                }
+
+                region.setEdges ( cropRect.toRectF() );
+                fireChanged();
+                invalidate();
+                return true;
+            }
+
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_CANCEL: {
+                activeTarget = TouchTarget.NONE;
+                getParent().requestDisallowInterceptTouchEvent (false);
+                invalidate();
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+
+
+    // =========================================================
+    // PUBLIC API
+    // =========================================================
+
+    public CropRect   getCropRect() { return cropRect; } // Returns current crop rect in image space.
+    public CropRegion getRegion()   { return region;   } // Returns the associated CropRegion.
+    public int        getColor()    { return color;    } // Returns the assigned color.
+    public boolean    isActive()    { return isActive; } // Returns whether this area is selected.
+
+    // Sets active state (selected / unselected).
+    public void setActive (boolean active) {
+        this.isActive = active;
+        invalidate();
+    }
+
+    // Sets the ZoomPanEngine reference.
+    public void setZoomPan (ZoomPanEngine zoomPan) {
+        this.zoomPan = zoomPan;
+        invalidate();
+    }
+
+    public void setChangeCallback       (ChangeCallback cb)       { this.changeCallback       = cb; }
+    public void setBringToFrontCallback (BringToFrontCallback cb) { this.bringToFrontCallback = cb; }
+
+
+
+    // =========================================================
+    // PRIVATE METHODS
+    // =========================================================
+
+    // Resolves what the user touched: a handle, the body, or nothing.
+    private TouchTarget resolveTouchTarget (float screenX, float screenY) {
+        RectF    rf         = zoomPan.imageRectToScreen ( cropRect.toRectF() );
+        CropRect screenRect = new CropRect (rf.left, rf.top, rf.right, rf.bottom);
+
+        // Check handles first (higher priority than body).
+        HandleType[] types = HandleType.values();
+        for (int i = 0; i < types.length; i++) {
+            PointF center    = HandlePositionCalculator.getCenter (types [i], screenRect);
+            float  hitRadius = handles [i].getHalfHitSize_px();
+
+            if (
+                Math.abs (screenX - center.x) <= hitRadius
+                &&
+                Math.abs (screenY - center.y) <= hitRadius
+            ) {
+                return CropAreaMaps.toTouchTarget (types [i]);
+            }
+        }
+
+        // Check body.
+        if (screenRect.contains (screenX, screenY)) return TouchTarget.BODY;
+
+        return TouchTarget.NONE;
+    }
+
+    private void fireChanged() {
+        if (changeCallback != null) changeCallback.onChanged (this);
+    }
+
+    // Returns image width from ZoomPanEngine.
+    private float getImageWidth() {
+        RectF  r  = zoomPan.getImageScreenRect();
+        PointF tl = zoomPan.screenToImage (r.left, r.top);
+        PointF br = zoomPan.screenToImage (r.right, r.bottom);
+        return br.x - tl.x;
+    }
+
+    // Returns image height from ZoomPanEngine.
+    private float getImageHeight() {
+        RectF  r  = zoomPan.getImageScreenRect();
+        PointF tl = zoomPan.screenToImage (r.left, r.top);
+        PointF br = zoomPan.screenToImage (r.right, r.bottom);
+        return br.y - tl.y;
+    }
+
+
+
+}

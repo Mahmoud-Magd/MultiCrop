@@ -10,11 +10,20 @@ Add the dependency to your project's `build.gradle`:
 
 ```gradle
 dependencies {
-    implementation 'com.magd:multicrop:VERSION'
+    implementation 'com.github.Mahmoud-Magd:MultiCrop:RELEASE_VERSION'
 }
 ```
 
-Replace `VERSION` with the latest release version from the [releases page](https://github.com/Mahmoud-Magd/MultiCrop/releases).
+Replace `RELEASE_VERSION` with the latest release version from the [releases page](https://github.com/Mahmoud-Magd/MultiCrop/releases).
+
+
+Right now the last one is "beta-0.0.0" ..
+
+```gradle
+dependencies {
+    implementation 'com.github.Mahmoud-Magd:MultiCrop:beta-0.0.0'
+}
+```
 
 
 
